@@ -6,3 +6,4 @@ openpyxl==3.1.5
 firebase-admin==6.5.0
 pyodbc==5.1.0
 gunicorn==22.0.0
+hdbcli==2.26.18
