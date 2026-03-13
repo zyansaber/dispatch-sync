@@ -20,7 +20,7 @@ import json
 import base64
 import logging
 import datetime as dt
-from typing import Dict, Any, Optional, List, Iterable
+from typing import Dict, Any, Optional, List, Iterable, Tuple
 
 import numpy as np
 import pandas as pd
@@ -74,12 +74,18 @@ DRY_RUN = os.getenv("DRY_RUN", "false").lower() == "true"
 DELETE_BATCH_SIZE = int(os.getenv("DELETE_BATCH_SIZE", "400"))
 PATCH_BATCH_SIZE = int(os.getenv("PATCH_BATCH_SIZE", "900"))
 
-DSN = (
-    "DRIVER={HDBODBC};"
-    f"SERVERNODE={HANA_SERVERNODE};"
-    f"UID={HANA_UID};"
-    f"PWD={HANA_PWD};"
+DSN_TMPL = (
+    "DRIVER={%s};"
+    "SERVERNODE=%s;"
+    "UID=%s;"
+    "PWD=%s;"
 )
+
+HANA_ODBC_DRIVER = os.getenv("HANA_ODBC_DRIVER", "HDBODBC")
+HANA_ODBC_DRIVER_FALLBACKS = [
+    d.strip() for d in os.getenv("HANA_ODBC_DRIVER_FALLBACKS", "HDBODBC32").split(",") if d.strip()
+]
+HANA_DB_PROVIDER = os.getenv("HANA_DB_PROVIDER", "auto").strip().lower()  # auto | odbc | hdbcli
 
 KEEP_FIELDS = {
     "EstimatedPickupAt",
@@ -228,8 +234,92 @@ def validate_required_env():
         raise RuntimeError(f"Missing required environment variables: {', '.join(missing)}")
 
 def hana_query(sql: str) -> pd.DataFrame:
-    with pyodbc.connect(DSN, autocommit=True) as conn:
+    provider = HANA_DB_PROVIDER
+    if provider not in {"auto", "odbc", "hdbcli"}:
+        raise RuntimeError("Invalid HANA_DB_PROVIDER. Use one of: auto, odbc, hdbcli")
+
+    if provider in {"auto", "odbc"}:
+        try:
+            return hana_query_via_odbc(sql)
+        except Exception as e:
+            if provider == "odbc":
+                raise
+            log.warning("ODBC query failed, trying hdbcli fallback: %s", e)
+
+    return hana_query_via_hdbcli(sql)
+
+
+def hana_query_via_odbc(sql: str) -> pd.DataFrame:
+    with pyodbc.connect(build_hana_dsn(), autocommit=True) as conn:
         return pd.read_sql(sql, conn)
+
+
+def parse_hana_servernode(servernode: str) -> Tuple[str, int]:
+    raw = (servernode or "").strip()
+    if not raw:
+        raise RuntimeError("HANA_SERVERNODE is required")
+
+    if ":" in raw:
+        host, port = raw.rsplit(":", 1)
+        host = host.strip()
+        try:
+            return host, int(port)
+        except ValueError as ex:
+            raise RuntimeError(f"Invalid HANA_SERVERNODE port: {servernode}") from ex
+
+    return raw, 30015
+
+
+def hana_query_via_hdbcli(sql: str) -> pd.DataFrame:
+    try:
+        from hdbcli import dbapi
+    except Exception as ex:
+        raise RuntimeError(
+            "hdbcli is not installed. Add `hdbcli` to requirements or set HANA_DB_PROVIDER=odbc with a working HANA ODBC driver."
+        ) from ex
+
+    host, port = parse_hana_servernode(HANA_SERVERNODE)
+    conn = dbapi.connect(address=host, port=port, user=HANA_UID, password=HANA_PWD)
+    try:
+        cur = conn.cursor()
+        cur.execute(sql)
+        rows = cur.fetchall()
+        cols = [d[0] for d in cur.description]
+        return pd.DataFrame(rows, columns=cols)
+    finally:
+        conn.close()
+
+
+def resolve_hana_driver() -> str:
+    available = set(pyodbc.drivers())
+    candidates = [HANA_ODBC_DRIVER, *HANA_ODBC_DRIVER_FALLBACKS]
+
+    for driver in candidates:
+        if driver in available:
+            if driver != HANA_ODBC_DRIVER:
+                log.warning(
+                    "Preferred ODBC driver '%s' not found. Using fallback '%s'.",
+                    HANA_ODBC_DRIVER,
+                    driver,
+                )
+            return driver
+
+    if available:
+        raise RuntimeError(
+            "No SAP HANA ODBC driver found. "
+            f"Tried: {', '.join(candidates)}. "
+            f"Available ODBC drivers: {', '.join(sorted(available))}. "
+            "Install SAP HANA client (HDBODBC/HDBODBC32) or set HANA_ODBC_DRIVER."
+        )
+
+    raise RuntimeError(
+        "No ODBC drivers are registered in this runtime. "
+        "Install unixODBC driver packages and SAP HANA client, then redeploy."
+    )
+
+
+def build_hana_dsn() -> str:
+    return DSN_TMPL % (resolve_hana_driver(), HANA_SERVERNODE, HANA_UID, HANA_PWD)
 
 def http_get_with_retry(url: str, timeout: int = 60) -> bytes:
     sess = requests.Session()
