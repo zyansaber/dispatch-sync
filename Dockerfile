@@ -10,10 +10,6 @@ RUN apt-get update && apt-get install -y \
     unixodbc-dev \
     && rm -rf /var/lib/apt/lists/*
 
-# 这里安装 SAP HANA client
-# 方式取决于你手上的安装包格式
-# 安装完成后，HDBODBC 库需要能被 unixODBC 找到
-
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
